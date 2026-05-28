@@ -8,7 +8,7 @@ on:
 jobs:
   tara:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 9
 
     steps:
       - name: Kodu indir
