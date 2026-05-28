@@ -1,7 +1,13 @@
 """
-ULUBEY KRİPTO TARAMA BOTU
+ULUBEY KRİPTO TARAMA BOTU  v2
 Binance API → Gösterge Hesaplama → Telegram Bildirim
 GitHub Actions ile 10 dakikada bir otomatik çalışır.
+
+v2 düzeltmeleri:
+  - Tüm tickerlar tek API çağrısıyla alınıyor (timeout sorunu çözüldü)
+  - Sadece hacmi yüksek ilk 80 coin taranıyor (~3 dk, limit dahilinde)
+  - Telegram 4096 karakter limiti için mesaj bölme eklendi
+  - sleep süresi 0.05 → 0.02 indirildi
 """
 
 import os, requests, time, math
@@ -18,16 +24,18 @@ API_BASES = [
     "https://api2.binance.com",
 ]
 
-INTERVAL  = "15m"
-LIMIT     = 96     # 96 × 15dk = 24 saat veri
-HEADERS   = {"User-Agent": "Mozilla/5.0"}
-TIMEOUT   = 15
+INTERVAL     = "15m"
+LIMIT        = 96       # 96 × 15dk = 24 saat veri
+HEADERS      = {"User-Agent": "Mozilla/5.0"}
+TIMEOUT      = 10       # saniye — 15'ten 10'a indirildi
+MAX_COINS    = 80       # en yüksek hacimli 80 coin taranır (~3 dk)
+TG_MAX_CHARS = 4000     # Telegram 4096 limit, güvenli marj bırakıldı
 
 # ── Filtre eşikleri ────────────────────────────────────────────────────────────
-MIN_CONFIDENCE = 65    # Güven > 65%
-MIN_VOLUME_X   = 1.5   # Hacim ≥ 1.5x
-MIN_GAIN_PCT   = 1.5   # Hedef kazanç ≥ %1.5
-MIN_RR         = 1.0   # R/R ≥ 1:1
+MIN_CONFIDENCE = 65
+MIN_VOLUME_X   = 1.5
+MIN_GAIN_PCT   = 1.5
+MIN_RR         = 1.0
 
 # ── Yardımcı: USD/TL kuru ─────────────────────────────────────────────────────
 def get_usdtl():
@@ -39,6 +47,39 @@ def get_usdtl():
         except:
             pass
     return 38.50
+
+# ── DÜZELTME: Tüm 24s tickerları tek seferde al, hacme göre sırala ─────────────
+def get_top_coins_by_volume(max_coins=MAX_COINS):
+    """
+    Tek API çağrısıyla tüm USDT tickerları al.
+    Quoty hacmine göre büyükten küçüğe sıralayıp ilk max_coins coini döndür.
+    Bu sayede klines çekilecek coin sayısı sınırlanır → timeout engellenir.
+    """
+    for base in API_BASES:
+        try:
+            r = requests.get(f"{base}/api/v3/ticker/24hr",
+                             headers=HEADERS, timeout=20)
+            tickers = r.json()
+            usdt = []
+            for t in tickers:
+                sym = t.get("symbol", "")
+                if (sym.endswith("USDT")
+                        and "UP" not in sym and "DOWN" not in sym
+                        and "BULL" not in sym and "BEAR" not in sym):
+                    try:
+                        usdt.append({
+                            "sym":    sym,
+                            "pct24h": float(t.get("priceChangePercent", 0)),
+                            "vol24h": float(t.get("quoteVolume", 0)),
+                        })
+                    except:
+                        pass
+            # Hacme göre büyükten küçüğe sırala
+            usdt.sort(key=lambda x: x["vol24h"], reverse=True)
+            return usdt[:max_coins]
+        except:
+            pass
+    return []
 
 # ── Yardımcı: Binance klines (OHLCV) ─────────────────────────────────────────
 def fetch_klines(sym):
@@ -59,18 +100,6 @@ def fetch_klines(sym):
         except:
             pass
     return None
-
-# ── Yardımcı: 24s ticker ──────────────────────────────────────────────────────
-def fetch_ticker(sym):
-    for base in API_BASES:
-        try:
-            r = requests.get(f"{base}/api/v3/ticker/24hr?symbol={sym}",
-                             headers=HEADERS, timeout=TIMEOUT)
-            d = r.json()
-            return float(d.get("priceChangePercent", 0)), float(d.get("quoteVolume", 0))
-        except:
-            pass
-    return 0.0, 0.0
 
 # ── Gösterge: EMA ─────────────────────────────────────────────────────────────
 def calc_ema(prices, period):
@@ -154,27 +183,42 @@ def get_signal(rsi, vol_x, macd_val, macd_sig, e9, e21, e50, bb_pos, elevated):
     macd_status = "AL" if macd_buy else "SAT"
     return sc, ema_status, macd_status
 
-# ── Telegram mesaj gönder ─────────────────────────────────────────────────────
+# ── DÜZELTME: Telegram mesajını 4096 karakter limitine böl ───────────────────
 def send_telegram(msg):
     if not TG_TOKEN or not TG_CHATID:
         print("Telegram token/chatid eksik!")
         return False
-    try:
-        url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-        r = requests.post(url, data={
-            "chat_id": TG_CHATID,
-            "text": msg,
-            "parse_mode": "HTML"
-        }, timeout=15)
-        return r.status_code == 200
-    except Exception as e:
-        print(f"Telegram hata: {e}")
-        return False
+    # Mesajı gerekirse parçalara böl
+    chunks = []
+    while len(msg) > TG_MAX_CHARS:
+        cut = msg.rfind("\n", 0, TG_MAX_CHARS)
+        if cut == -1:
+            cut = TG_MAX_CHARS
+        chunks.append(msg[:cut])
+        msg = msg[cut:].lstrip("\n")
+    chunks.append(msg)
+
+    ok = True
+    for chunk in chunks:
+        try:
+            url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+            r = requests.post(url, data={
+                "chat_id": TG_CHATID,
+                "text": chunk,
+                "parse_mode": "HTML"
+            }, timeout=15)
+            if r.status_code != 200:
+                print(f"Telegram hata kodu: {r.status_code} — {r.text[:200]}")
+                ok = False
+        except Exception as e:
+            print(f"Telegram hata: {e}")
+            ok = False
+    return ok
 
 # ── Hacim etiketi ─────────────────────────────────────────────────────────────
 def vol_label(vx):
-    if vx >= 5:   return f"{vx:.1f}x (5x PATLAMA)"
-    if vx >= 2:   return f"{vx:.1f}x (2x PATLAMA)"
+    if vx >= 5:  return f"{vx:.1f}x (5x PATLAMA)"
+    if vx >= 2:  return f"{vx:.1f}x (2x PATLAMA)"
     return f"{vx:.1f}x (1.5x+)"
 
 # ── Ana tarama ────────────────────────────────────────────────────────────────
@@ -185,173 +229,151 @@ def main():
     usdtl = get_usdtl()
     print(f"USD/TL: {usdtl:.2f}")
 
-    # Coin listesi al
-    coins = []
-    for base in API_BASES:
-        try:
-            r = requests.get(f"{base}/api/v3/exchangeInfo",
-                             headers=HEADERS, timeout=20)
-            syms = r.json().get("symbols", [])
-            for s in syms:
-                n = s["symbol"]
-                if (s["status"] == "TRADING" and n.endswith("USDT")
-                        and "UP" not in n and "DOWN" not in n
-                        and "BULL" not in n and "BEAR" not in n):
-                    coins.append(n)
-            coins = list(set(coins))
-            break
-        except:
-            pass
-
-    if not coins:
+    # Tek API çağrısıyla en yüksek hacimli MAX_COINS coini al
+    top_coins = get_top_coins_by_volume(MAX_COINS)
+    if not top_coins:
         print("Coin listesi alınamadı!")
         return
 
-    print(f"{len(coins)} coin taranıyor...")
+    print(f"En yüksek hacimli {len(top_coins)} coin taranıyor...")
 
-    # Koşul alarmı için eşleşen coinler
     match_coins  = []
-    # Ana rapor için güçlü sinyaller
     strong_coins = []
-
     ok_n = 0
-    for sym in coins:
+
+    for coin_info in top_coins:
+        sym    = coin_info["sym"]
+        pct24h = coin_info["pct24h"]
+        vol24h = coin_info["vol24h"]
+
         try:
             data = fetch_klines(sym)
             if not data:
                 continue
             ts, op, hi, lo, cl, vo = data
-            n = len(cl)
 
-            # 24s değişim & hacim
-            pct24h, vol24h = fetch_ticker(sym)
-            time.sleep(0.05)  # rate limit koruması
+            time.sleep(0.02)  # DÜZELTME: 0.05 → 0.02
 
             # Göstergeler
-            rsi_arr  = calc_rsi(cl)
+            rsi_arr         = calc_rsi(cl)
             macd_arr, sig_arr = calc_macd(cl)
-            e9_arr   = calc_ema(cl, 9)
-            e21_arr  = calc_ema(cl, 21)
-            e50_arr  = calc_ema(cl, 50)
+            e9_arr          = calc_ema(cl, 9)
+            e21_arr         = calc_ema(cl, 21)
+            e50_arr         = calc_ema(cl, 50)
             bb_u, bb_m, bb_l = calc_bb(cl)
-            atr_arr  = calc_atr(hi, lo, cl)
+            atr_arr         = calc_atr(hi, lo, cl)
 
-            cur_p  = cl[-1]
+            cur_p   = cl[-1]
             cur_rsi = rsi_arr[-1]
             cur_atr = atr_arr[-1]
             atr_pct = cur_atr / max(cur_p, 1e-10) * 100
 
-            # Hacim çarpanı
-            mean_vol = sum(vo[-21:-1]) / 20 if len(vo) >= 21 else sum(vo) / len(vo)
+            # Hacim çarpanı (son mum / 20 mum ortalaması)
+            mean_vol = sum(vo[-21:-1]) / 20
             vol_x    = vo[-1] / max(mean_vol, 1e-10)
-            if math.isnan(vol_x) or math.isinf(vol_x) or vol_x <= 0:
+            if not math.isfinite(vol_x) or vol_x <= 0:
                 vol_x = 1.0
 
-            # BB pozisyonu
+            # Bollinger pozisyonu
             bb_range = bb_u[-1] - bb_l[-1]
             bb_pos   = (cur_p - bb_l[-1]) / max(bb_range, 1e-10)
-
-            # EMA & MACD durumu
-            sc, ema_st, macd_st = get_signal(
-                cur_rsi, vol_x, macd_arr[-1], sig_arr[-1],
-                e9_arr[-1], e21_arr[-1], e50_arr[-1], bb_pos,
-                elevated=False
-            )
 
             # Alış / satış seviyeleri
             buy_p  = bb_l[-1] * 1.003
             sell_p = bb_u[-1] * 0.997
-            if buy_p <= 0:  buy_p  = cur_p * 0.97
-            if sell_p <= buy_p: sell_p = cur_p * 1.06
+            if buy_p <= 0:       buy_p  = cur_p * 0.97
+            if sell_p <= buy_p:  sell_p = cur_p * 1.06
 
             elevated = cur_p > buy_p * 1.015
 
-            # Güven → elevated cezası
-            if elevated:
-                sc = max(sc - 20, 0)
+            # Sinyal skoru (elevated dahil)
+            sc, ema_st, macd_st = get_signal(
+                cur_rsi, vol_x, macd_arr[-1], sig_arr[-1],
+                e9_arr[-1], e21_arr[-1], e50_arr[-1], bb_pos,
+                elevated=elevated
+            )
 
             gain_pct = (sell_p - buy_p) / max(buy_p, 1e-10) * 100
             sl_pct   = max(2.5, atr_pct * 2)
             sl_price = buy_p * (1 - sl_pct / 100)
             rr       = gain_pct / max(sl_pct, 0.01)
 
-            # ── KOŞUL ALARMI filtreleri ──────────────────────────────────────
-            ema_ok    = ema_st == "YUKARI"
-            macd_ok   = macd_st == "AL"
-            hacim_ok  = vol_x >= MIN_VOLUME_X
-            guven_ok  = sc > MIN_CONFIDENCE
-            not_elev  = not elevated
-            gain_ok   = gain_pct >= MIN_GAIN_PCT
-            rr_ok     = rr >= MIN_RR
-
-            if ema_ok and macd_ok and hacim_ok and guven_ok and not_elev and gain_ok and rr_ok:
+            # ── KOŞUL ALARMI ──────────────────────────────────────────────────
+            if (ema_st == "YUKARI" and macd_st == "AL"
+                    and vol_x >= MIN_VOLUME_X
+                    and sc > MIN_CONFIDENCE
+                    and not elevated
+                    and gain_pct >= MIN_GAIN_PCT
+                    and rr >= MIN_RR):
                 match_coins.append({
                     "sym": sym, "cur_p": cur_p, "buy_p": buy_p,
                     "sell_p": sell_p, "sl": sl_price, "rsi": cur_rsi,
-                    "vol_x": vol_x, "gain_pct": gain_pct,
-                    "rr": rr, "conf": sc, "pct24h": pct24h,
-                    "ema_st": ema_st, "macd_st": macd_st, "atr_pct": atr_pct
+                    "vol_x": vol_x, "gain_pct": gain_pct, "rr": rr,
+                    "conf": sc, "pct24h": pct24h,
+                    "ema_st": ema_st, "macd_st": macd_st,
                 })
 
-            # ── ANA RAPOR: güçlü sinyal ──────────────────────────────────────
+            # ── ANA RAPOR: güçlü sinyal ───────────────────────────────────────
             if sc >= 70 and vol_x >= 2.0 and ema_st == "YUKARI" and not elevated:
                 strong_coins.append({
                     "sym": sym, "cur_p": cur_p, "buy_p": buy_p,
                     "sell_p": sell_p, "sl": sl_price, "rsi": cur_rsi,
-                    "vol_x": vol_x, "gain_pct": gain_pct,
-                    "rr": rr, "conf": sc, "pct24h": pct24h,
-                    "ema_st": ema_st, "macd_st": macd_st
+                    "vol_x": vol_x, "gain_pct": gain_pct, "rr": rr,
+                    "conf": sc, "pct24h": pct24h,
                 })
 
             ok_n += 1
 
         except Exception as e:
-            pass
+            print(f"{sym} hata: {e}")
 
-    print(f"Tamamlandı: {ok_n}/{len(coins)} coin")
+    print(f"Tamamlandı: {ok_n}/{len(top_coins)} coin")
 
-    # ── ANA RAPOR ────────────────────────────────────────────────────────────
-    lines = []
-    lines.append(f"<b>ULUBEY KRİPTO — {now_str}</b>")
-    lines.append(f"Tarama: {len(coins)} coin  |  USD/TL: {usdtl:.2f}")
-    lines.append("")
-
+    # ── ANA RAPOR ─────────────────────────────────────────────────────────────
+    lines = [
+        f"<b>ULUBEY KRİPTO — {now_str}</b>",
+        f"Tarama: hacimce ilk {len(top_coins)} coin  |  USD/TL: {usdtl:.2f}",
+        "",
+    ]
     if strong_coins:
         lines.append(f"<b>GÜÇLÜ AL SİNYALLERİ ({len(strong_coins)} coin)</b>")
         for i, d in enumerate(strong_coins[:5], 1):
             cs = d["sym"].replace("USDT", "")
-            lines.append(f"\n<b>{i}. {cs}/USDT</b>  —  Güven: <b>{d['conf']:.0f}%</b>")
-            lines.append(f"Fiyat: <b>{d['cur_p']*usdtl:.4f} TL</b>  |  24h: {d['pct24h']:.1f}%")
-            lines.append(f"Hacim: {vol_label(d['vol_x'])}  |  RSI: {d['rsi']:.1f}")
-            lines.append(f"Alış: <b>{d['buy_p']*usdtl:.4f} TL</b>  →  Hedef: <b>{d['sell_p']*usdtl:.4f} TL</b>  (+{d['gain_pct']:.1f}%)")
-            lines.append(f"Stop: {d['sl']*usdtl:.4f} TL  |  R/R: 1:{d['rr']:.1f}")
-            lines.append("------")
+            lines += [
+                f"\n<b>{i}. {cs}/USDT</b>  —  Güven: <b>{d['conf']:.0f}%</b>",
+                f"Fiyat: <b>{d['cur_p']*usdtl:.4f} TL</b>  |  24h: {d['pct24h']:.1f}%",
+                f"Hacim: {vol_label(d['vol_x'])}  |  RSI: {d['rsi']:.1f}",
+                f"Alış: <b>{d['buy_p']*usdtl:.4f} TL</b>  →  Hedef: <b>{d['sell_p']*usdtl:.4f} TL</b>  (+{d['gain_pct']:.1f}%)",
+                f"Stop: {d['sl']*usdtl:.4f} TL  |  R/R: 1:{d['rr']:.1f}",
+                "------",
+            ]
     else:
         lines.append("<b>Güçlü AL sinyali bulunamadı</b> — piyasa sakin, bekleyin.")
 
     send_telegram("\n".join(lines))
     print(f"Ana rapor gönderildi ({len(strong_coins)} güçlü sinyal)")
 
-    # ── KOŞUL ALARMI ─────────────────────────────────────────────────────────
+    # ── KOŞUL ALARMI ──────────────────────────────────────────────────────────
     if match_coins:
-        lines2 = []
-        lines2.append(f"<b>ULUBEY — KOŞUL ALARMI  {datetime.now().strftime('%H:%M')}</b>")
-        lines2.append(f"<b>{len(match_coins)} coin 4 koşulu birden karşılıyor:</b>")
-        lines2.append("✅ EMA = YUKARI   ✅ MACD = AL")
-        lines2.append("✅ Hacim > 1.5x   ✅ Güven > 65%")
-        lines2.append("")
-
+        lines2 = [
+            f"<b>ULUBEY — KOŞUL ALARMI  {datetime.now().strftime('%H:%M')}</b>",
+            f"<b>{len(match_coins)} coin 4 koşulu birden karşılıyor:</b>",
+            "✅ EMA = YUKARI   ✅ MACD = AL",
+            "✅ Hacim > 1.5x   ✅ Güven > 65%",
+            "",
+        ]
         for i, d in enumerate(match_coins[:8], 1):
             cs = d["sym"].replace("USDT", "")
-            lines2.append(f"<b>{i}. {cs}/USDT</b>  —  Güven: <b>{d['conf']:.0f}%</b>  |  R/R: 1:{d['rr']:.1f}")
-            lines2.append(f"Fiyat: <b>{d['cur_p']*usdtl:.4f} TL</b>  |  24h: {d['pct24h']:.1f}%")
-            lines2.append(f"✅ EMA: {d['ema_st']}  |  ✅ MACD: {d['macd_st']}")
-            lines2.append(f"✅ Hacim: {vol_label(d['vol_x'])}  |  RSI: {d['rsi']:.1f}")
-            lines2.append(f"Alış: <b>{d['buy_p']*usdtl:.4f} TL</b>  →  Hedef: <b>{d['sell_p']*usdtl:.4f} TL</b>  (+{d['gain_pct']:.1f}%)")
-            lines2.append(f"Stop: {d['sl']*usdtl:.4f} TL  |  Pump: -")
-            lines2.append("- - -")
-
-        lines2.append(f"\nTarama: {len(coins)} coin  |  USD/TL: {usdtl:.2f}")
+            lines2 += [
+                f"<b>{i}. {cs}/USDT</b>  —  Güven: <b>{d['conf']:.0f}%</b>  |  R/R: 1:{d['rr']:.1f}",
+                f"Fiyat: <b>{d['cur_p']*usdtl:.4f} TL</b>  |  24h: {d['pct24h']:.1f}%",
+                f"✅ EMA: {d['ema_st']}  |  ✅ MACD: {d['macd_st']}",
+                f"✅ Hacim: {vol_label(d['vol_x'])}  |  RSI: {d['rsi']:.1f}",
+                f"Alış: <b>{d['buy_p']*usdtl:.4f} TL</b>  →  Hedef: <b>{d['sell_p']*usdtl:.4f} TL</b>  (+{d['gain_pct']:.1f}%)",
+                f"Stop: {d['sl']*usdtl:.4f} TL  |  R/R: 1:{d['rr']:.1f}",
+                "- - -",
+            ]
+        lines2.append(f"\nTarama: ilk {len(top_coins)} coin  |  USD/TL: {usdtl:.2f}")
         send_telegram("\n".join(lines2))
         print(f"Koşul alarmı gönderildi ({len(match_coins)} coin)")
     else:
