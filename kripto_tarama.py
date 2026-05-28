@@ -32,7 +32,7 @@ MAX_COINS    = 80       # en yüksek hacimli 80 coin taranır (~3 dk)
 TG_MAX_CHARS = 4000     # Telegram 4096 limit, güvenli marj bırakıldı
 
 # ── Filtre eşikleri ────────────────────────────────────────────────────────────
-MIN_CONFIDENCE = 65
+MIN_CONFIDENCE = 45
 MIN_VOLUME_X   = 1.5
 MIN_GAIN_PCT   = 1.5
 MIN_RR         = 1.0
