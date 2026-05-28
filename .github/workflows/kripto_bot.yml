@@ -1,0 +1,29 @@
+name: Kripto Tarama Botu
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+jobs:
+  tara:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+
+    steps:
+      - name: Kodu indir
+        uses: actions/checkout@v4
+
+      - name: Python kur
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Kütüphaneleri yükle
+        run: pip install requests
+
+      - name: Kripto taraması yap
+        env:
+          TG_TOKEN:  ${{ secrets.TG_TOKEN }}
+          TG_CHATID: ${{ secrets.TG_CHATID }}
+        run: python kripto_tarama.py
